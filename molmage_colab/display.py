@@ -1,4 +1,9 @@
-"""Notebook output: every function shows one caption line and one row of panels."""
+"""Notebook output: every function shows one caption line and one row of panels.
+
+The MolMage row, the snapshot row and the 3D view share one canvas of CANVAS_W x CANVAS_H CSS pixels.
+"""
+import base64
+import io
 import shutil
 from pathlib import Path
 
@@ -8,10 +13,14 @@ from . import paths
 from .pipeline import _require, render
 from .ui import note
 
+CANVAS_W, CANVAS_H = 1000, 280  # CSS px, the same for all three outputs; 4 square panels fill it exactly
+TITLE_H, PAD, GAP = 28, 8, 14   # title band above the panels, outer padding, space between panels (px)
+TITLE_PX = 14                    # panel title font size (px)
+FONT = "DejaVu Sans, Verdana, Arial, sans-serif"  # matplotlib's default font, then look-alikes for plotly
+
 ATOM_COLORS = {"H": "#E8E8E8", "C": "#505050", "N": "#3050F8", "O": "#FF0D0D", "F": "#1FF01F", "P": "#FF8000",
                "S": "#E6C200", "Cl": "#1FF01F", "Br": "#A62929", "I": "#940094"}
 ATOM_SIZES = {"H": 4}
-MAX_ROW_WIDTH = 16.0  # inches
 
 
 # --------------------------------------------------------------------------- captions
@@ -33,21 +42,31 @@ def caption(result):
 
 
 # --------------------------------------------------------------------------- static rows
-def _row(panels, height=3.4):
-    """panels: list of (title, image, imshow kwargs) drawn side by side in one figure."""
-    import matplotlib.pyplot as plt
+def _row(panels):
+    """Draw (title, image, imshow kwargs) panels as equal squares on the shared canvas.
 
-    aspects = [img.shape[1] / img.shape[0] for _, img, _ in panels]
-    height = min(height, MAX_ROW_WIDTH / sum(aspects))
-    fig, axes = plt.subplots(1, len(panels), figsize=(height * sum(aspects), height + 0.35),
-                             gridspec_kw=dict(width_ratios=aspects), squeeze=False)
-    for ax, (title, img, kwargs) in zip(axes[0], panels):
+    Up to 4 panels are full height (236 px on the default canvas); the row is centred horizontally and
+    the titles always sit in the same band at the top.
+    """
+    from IPython.display import HTML, display
+    from matplotlib.figure import Figure
+
+    n = len(panels)
+    side = min((CANVAS_W - 2 * PAD - (n - 1) * GAP) / n, CANVAS_H - 2 * PAD - TITLE_H)
+    x0 = (CANVAS_W - n * side - (n - 1) * GAP) / 2
+    y0 = CANVAS_H - PAD - TITLE_H - side  # bottom edge of the panels (matplotlib measures from the bottom)
+    fig = Figure(figsize=(CANVAS_W / 100, CANVAS_H / 100), dpi=100, facecolor="white")  # 1 figure px = 1 CSS px
+    for k, (title, img, kwargs) in enumerate(panels):
+        left = x0 + k * (side + GAP)
+        ax = fig.add_axes((left / CANVAS_W, y0 / CANVAS_H, side / CANVAS_W, side / CANVAS_H))
         ax.imshow(img, **kwargs)
-        ax.set_title(title, fontsize=10)
+        ax.set_title(title, fontsize=TITLE_PX * 0.72, pad=6)  # px -> pt at 100 dpi
         ax.axis("off")
-    fig.subplots_adjust(left=0.005, right=0.995, bottom=0.01, top=0.9, wspace=0.04)
-    plt.show()
-    plt.close(fig)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, facecolor="white")  # 2x pixels, shown at 1x: sharp on HiDPI screens
+    data = base64.b64encode(buf.getvalue()).decode()
+    display(HTML(f'<img src="data:image/png;base64,{data}" width="{CANVAS_W}" height="{CANVAS_H}" '
+                 'style="display:block; max-width:none">'))
 
 
 def _load_png(path):
@@ -114,7 +133,7 @@ def show_snapshots(result=None, views=4, size=512, samples=32):
     images = _crop_frames([_load_png(p) for p in frames])
     titles = [f"{round(360 * k / views)}°" for k in range(views)]
     titles[0] += " · official view"
-    _row([(t, img, {}) for t, img in zip(titles, images)], height=3.6)
+    _row([(t, img, {}) for t, img in zip(titles, images)])
 
 
 # --------------------------------------------------------------------------- interactive row
@@ -172,7 +191,6 @@ def show_mesh(result=None, color_by="patch", atoms=True):
     color_by="patch" colours the decoded mesh by UV patch (as in the snapshots); "position" uses the
     MolMage x, y, z colours on both meshes.
     """
-    import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     result = _require(result)
@@ -181,9 +199,10 @@ def show_mesh(result=None, color_by="patch", atoms=True):
     dec = np.load(result.file("_mmg_mesh.npz"))
     dv, df = dec["vert"], dec["face"]
     dec_rgb = dec["vert_color"] if color_by == "patch" else dv * 0.5 + 0.5
-    decoded = _mesh_trace(dv, df, rgb=dec_rgb)
+    columns = [[_mesh_trace(dv, df, rgb=dec_rgb)]]
+    titles = [f"decoded from the MolMage ({len(df):,} faces)"]
     surf_file = result.file("_surface.npz")
-    if surf_file.exists():
+    if surf_file.exists():  # encoded here (not loaded from a file): show the input next to it
         surf = np.load(surf_file)
         sv = to_blender_frame(surf["vert"])
         left = [_mesh_trace(sv, surf["face"], rgb=sv * 0.5 + 0.5 if color_by == "position" else None,
@@ -191,19 +210,19 @@ def show_mesh(result=None, color_by="patch", atoms=True):
         if atoms:
             left += _atom_traces(to_blender_frame(surf["atom_xyz"], ref=surf["vert"]), surf["atom_symbol"],
                                  surf["bonds"])
-        fig = make_subplots(rows=1, cols=2, specs=[[{"type": "scene"}, {"type": "scene"}]], horizontal_spacing=0.02,
-                            subplot_titles=(f"input · conformer + PyMOL surface ({len(surf['face']):,} faces)",
-                                            f"decoded from the MolMage ({len(df):,} faces)"))
-        for trace in left:
-            fig.add_trace(trace, row=1, col=1)
-        fig.add_trace(decoded, row=1, col=2)
-    else:
-        fig = go.Figure(decoded)
-        fig.update_layout(title=dict(text=f"decoded from the MolMage ({len(df):,} faces)", x=0.5, font=dict(size=14)))
+        columns.insert(0, left)
+        titles.insert(0, f"input · conformer + PyMOL surface ({len(surf['face']):,} faces)")
+    fig = make_subplots(rows=1, cols=len(columns), specs=[[{"type": "scene"}] * len(columns)],
+                        horizontal_spacing=GAP / (CANVAS_W - 2 * PAD), subplot_titles=titles)
+    for col, traces in enumerate(columns, start=1):
+        for trace in traces:
+            fig.add_trace(trace, row=1, col=col)
     axis = dict(visible=False)
     fig.update_scenes(aspectmode="data", xaxis=axis, yaxis=axis, zaxis=axis,
-                      camera=dict(eye=dict(x=0.0, y=-1.9, z=0.6), up=dict(x=0, y=0, z=1)))
-    fig.update_layout(height=470, margin=dict(l=0, r=0, t=36, b=0), showlegend=False, paper_bgcolor="white")
+                      camera=dict(eye=dict(x=0.0, y=-1.6, z=0.5), up=dict(x=0, y=0, z=1)))
+    fig.update_annotations(font=dict(size=TITLE_PX, color="black"), yshift=2)  # titles level with _row's
+    fig.update_layout(width=CANVAS_W, height=CANVAS_H, margin=dict(l=PAD, r=PAD, t=PAD + TITLE_H, b=PAD),
+                      font=dict(family=FONT), showlegend=False, paper_bgcolor="white")
     fig.show()
 
 
